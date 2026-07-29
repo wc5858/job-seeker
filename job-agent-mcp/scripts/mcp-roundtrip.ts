@@ -3,6 +3,8 @@
  * SDK client, lists tools, and drives navigate → click against a local site.
  */
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
@@ -24,11 +26,12 @@ const transport = new StdioClientTransport({
   stderr: "inherit",
   env: {
     ...process.env,
-    HEADLESS: "1",
-    JOB_AGENT_PROFILE: "/tmp/ja-profile-rt",
-    ...(process.env.JOB_AGENT_EXECUTABLE
-      ? { JOB_AGENT_EXECUTABLE: process.env.JOB_AGENT_EXECUTABLE }
-      : {}),
+    // Dedicated port + profile so the test never fights the browser the user is
+    // working in. os.tmpdir() rather than "/tmp": a POSIX path here makes Chrome
+    // fail to start on Windows.
+    JOB_AGENT_CDP: process.env.JOB_AGENT_CDP ?? "9336",
+    JOB_AGENT_PROFILE: process.env.JOB_AGENT_PROFILE ?? path.join(os.tmpdir(), "ja-profile-rt"),
+    JOB_AGENT_SPAWN_ARGS: process.env.JOB_AGENT_SPAWN_ARGS ?? "--headless=new",
   },
 });
 const client = new Client({ name: "smoke-client", version: "0.0.1" });

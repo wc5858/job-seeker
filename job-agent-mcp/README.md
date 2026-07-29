@@ -6,14 +6,17 @@ human and the agent share the same browser window. One server, many clients:
 Claude Code, Claude Desktop, and cloud Cowork sessions (proxied through the
 desktop bridge as `mcp__remote-devices__job-agent__*`).
 
-## Tools (v0.2)
+## Tools (v0.3)
 
 | Tool | Description |
 |---|---|
 | `browser_navigate` | Open a URL in the active tab, returns an ARIA snapshot |
-| `browser_snapshot` | Read the current page as an ARIA (role+name) tree; `offset` paginates |
+| `browser_snapshot` | Read the current page as an ARIA (role+name) tree; `offset` paginates, `scope` narrows to a subtree, `full` ignores the scope |
+| `browser_set_snapshot_scope` | Set a session-wide snapshot scope so *every* tool returns just that subtree |
+| `browser_diff` | Verify the last action: what changed since the previous snapshot/diff |
 | `browser_click` | Click by ARIA role+name (preferred) or raw Playwright selector |
-| `browser_fill` | Fill a text input (never submits) |
+| `browser_fill` | Fill a text input or contenteditable (never submits) |
+| `browser_select` | Choose an option in a native `<select>` |
 | `browser_press` | Press a keyboard key (`Enter`, `Escape`, ...) |
 | `browser_screenshot` | Viewport screenshot — fallback sense for oddly structured pages |
 | `browser_tabs` | List open tabs |
@@ -23,6 +26,102 @@ desktop bridge as `mcp__remote-devices__job-agent__*`).
 Design notes: perception is ARIA-first (what the agent reads is exactly what it
 can click); screenshots are the fallback. **No tool sends messages or submits
 applications autonomously — send-class actions always go through the human.**
+
+### Picking the right tool for a form control
+
+Three controls look alike in a snapshot but fail in different ways, so they get
+different tools:
+
+| Control | Tool |
+|---|---|
+| Text input, textarea, `contenteditable` | `browser_fill` |
+| Native `<select>` | `browser_select` |
+| Typeahead / autocomplete listbox (LinkedIn company, location) | `browser_fill`, then `browser_press` `ArrowDown` + `Enter` |
+
+`browser_select` only accepts a real `<select>`; point it at anything else and
+it says which of the other two paths to take. Give it the option's visible text
+(`Full-time`); its `value` attribute and a unique prefix (`Jan` → `January`)
+also work, and a wrong value comes back with the actual option list.
+
+### Keeping snapshots small
+
+A full LinkedIn profile page is a 12k–30k-char ARIA tree when all the agent
+needs is the open dialog. Two mechanisms cut that down:
+
+```
+browser_set_snapshot_scope  scope='div[role="dialog"]'
+```
+
+Every tool that returns a snapshot (navigate/click/press/select/snapshot/back)
+then returns only that subtree until you clear it. If the selector stops
+matching — the dialog closed — snapshots fall back to the full page and say
+`scope missed, full page` rather than silently returning nothing. Pass `scope`
+to `browser_snapshot` directly to override it for a single call (`body` forces
+a full read).
+
+Second, Playwright's ARIA snapshot enumerates every `<option>`, so one year
+picker (1926–2026) costs more than the dialog around it. Option lists longer
+than 10 collapse to a summary line:
+
+```
+- combobox "Start year": [102 options collapsed, selected "2019"] — set it with browser_select
+```
+
+Short lists stay expanded, and typeahead `listbox` popups are never collapsed —
+reading the filtered suggestions is the whole point of that interaction. To see
+a collapsed list, scope a snapshot at that select (`scope: '#start-year'`), or
+just call `browser_select`, which reports the real options when it misses.
+
+On the LinkedIn *Add experience* form this takes the worst tool result from
+~12,000 chars to under 1,700.
+
+### Verifying that a step actually worked
+
+Tools report success on the *call*, not on the *result*. Two silent failures
+seen on LinkedIn: `browser_fill` appended into a contenteditable instead of
+replacing (`"Fullstack EngineerStaff Engineer"`), and a Ctrl+A/Delete pair
+failed to clear a field so the next fill appended again. Both tool calls
+returned success.
+
+`browser_diff` is the check. Take a `browser_snapshot` to set a baseline, act,
+then diff:
+
+```
+~ [9] textbox "Headline": value "Fullstack Engineer" → "Fullstack EngineerStaff Engineer"
+- [24] dialog "Add experience" (+264 descendants)
++ [3/1] option "Ant Group" (aria-pressed=true)
+```
+
+The most important answer it gives is `no changes` — spelled out, never an
+empty string, because that means your last action had **no effect**.
+
+Details that matter:
+
+- Nodes are paired by **keyed sibling alignment**, never by a global role+name
+  lookup. LinkedIn's company picker renders three buttons all named "Ant
+  Group"; a global lookup mixes them up by construction. Alignment runs only
+  between the children of two already-paired parents, and tells duplicates
+  apart by their ordinal in that list — so inserting one row into the middle
+  of a list is reported as a single `added`, not as a cascade of renamed
+  siblings. Paths like `2/4/1` are addresses in the output, not the pairing
+  mechanism.
+- The model is read from the DOM, not from the ARIA tree, so it carries
+  `value` for inputs, selects and contenteditables. The ARIA tree omits
+  contenteditable text entirely — the exact field the append bug lived in.
+- A subtree that appears or vanishes is reported at its root with a
+  descendant count, not as hundreds of lines.
+- Scope is applied first, then the diff. On a real page the ads, "People you
+  may know" and notification counts churn on every render; scope removes the
+  irrelevant regions, the diff removes the unchanged ones. That order is not
+  interchangeable.
+- It falls back to a plain full snapshot — saying why — when there is no
+  baseline, after navigation, when the scope or URL changed, when the baseline
+  is over 5 minutes old, or when the diff would not be smaller than the
+  snapshot (`diff too large, returned full snapshot`).
+
+`browser_snapshot({ full: true })` forces a complete page read, ignoring the
+scope, and leaves the baseline untouched so it does not disturb a verification
+in progress.
 
 ## Install
 
@@ -105,17 +204,40 @@ tools as `mcp__remote-devices__job-agent__*` automatically.
 ```bash
 npm run typecheck
 npm run smoke                      # offline self-hosted site, full tool internals
+npm run golden                     # golden set: LinkedIn "Add experience" replica
+npm run roundtrip                  # real MCP stdio round-trip
 npx tsx scripts/attach-test.ts     # auto-spawn + attach path
-npx tsx scripts/mcp-roundtrip.ts   # real MCP stdio round-trip
 ```
 
-In headless environments, set `CHROME_PATH` and
-`JOB_AGENT_SPAWN_ARGS="--headless=new,--no-sandbox"`.
+`npm run golden` is the regression gate for form automation: a hermetic replica
+of LinkedIn's *Add experience* dialog carrying all three control types at once,
+driven through the real MCP server over stdio. It asserts the tool contract
+(including error strings) and enforces the token budget — no tool result in the
+scoped flow may exceed 2000 characters.
+
+It also asserts *what each step should change in the DOM*, via `assertDiff`:
+
+- an empty diff is a hard failure — the step silently did nothing;
+- an unmet expectation is a hard failure;
+- changes beyond what was expected are flagged for manual confirmation rather
+  than failed, since the page structure may simply have moved on.
+
+The fixture deliberately includes a headline field that appends instead of
+replacing, and one case asserts that `assertDiff` *catches* it — a golden set
+that cannot detect the known-bad behaviour is not protecting anything. After
+changing a prompt or a selector, this pinpoints which step regressed instead of
+leaving you to judge the final state.
+
+`golden` and `roundtrip` use their own CDP port and profile, so they never
+disturb the browser you are working in. In headless environments, set
+`CHROME_PATH` and `JOB_AGENT_SPAWN_ARGS="--headless=new,--no-sandbox"`.
 
 ## Roadmap
 
 - [ ] `browser_tab_select` — explicit tab targeting (the "last tab" heuristic is fragile)
 - [ ] Domain tools: `search_jobs` / `extract_jd` on top of the atomic tools
-- [ ] Golden-set regression: offline snapshots of job pages + assertions
+- [x] Golden-set regression: LinkedIn *Add experience* form (`npm run golden`)
+- [ ] Golden set for job search / JD extraction pages
 - [ ] Screenshot-based extraction for fields not exposed in the ARIA tree
+      (contenteditable text is one — the ARIA tree omits it entirely)
 - [ ] Standalone agent loop + CLI as an alternative decision layer

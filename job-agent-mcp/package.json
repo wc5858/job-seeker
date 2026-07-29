@@ -7,6 +7,8 @@
     "start": "tsx src/server.ts",
     "login": "tsx src/login.ts",
     "smoke": "tsx scripts/smoke.ts",
+    "golden": "tsx scripts/golden-add-experience.ts",
+    "roundtrip": "tsx scripts/mcp-roundtrip.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
