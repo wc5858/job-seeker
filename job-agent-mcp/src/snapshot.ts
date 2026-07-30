@@ -87,6 +87,39 @@ function collapseSelectOptions(content: string): string {
   return out.join("\n");
 }
 
+/**
+ * Container roles whose emptiness means "content is missing here", so an agent
+ * reading the tree does not mistake a lazy placeholder for the end of a list.
+ *
+ * `cell` and `option` are deliberately excluded: an empty table cell or an empty
+ * placeholder <option> is ordinary markup, not a symptom.
+ */
+const PLACEHOLDER_ROLES = new Set([
+  "listitem", "article", "row", "treeitem", "group", "region", "tabpanel", "figure",
+]);
+
+/**
+ * Mark container nodes that carry no accessible content at all.
+ *
+ * Playwright serializes a node with children as `- listitem:` and a named one as
+ * `- listitem "x"`; a bare `- listitem` therefore has neither. On a lazy list
+ * that is a row whose contents have not rendered yet — the failure that returns
+ * a well-formed but incomplete answer instead of an error.
+ */
+function markUnrendered(content: string): { text: string; count: number } {
+  let count = 0;
+  const text = content
+    .split("\n")
+    .map((line) => {
+      const m = /^\s*- ([a-z]+)\s*$/.exec(line);
+      if (!m || !PLACEHOLDER_ROLES.has(m[1])) return line;
+      count++;
+      return `${line} [not rendered]`;
+    })
+    .join("\n");
+  return { text, count };
+}
+
 export interface SnapshotResult {
   url: string;
   title: string;
@@ -98,6 +131,8 @@ export interface SnapshotResult {
   scope?: string;
   /** True when `scope` was requested but matched nothing — content is the full page. */
   scopeMissed: boolean;
+  /** Container nodes with no accessible content — lazy rows that have not rendered. */
+  unrendered: number;
 }
 
 /**
@@ -140,9 +175,13 @@ export async function snapshotPage(
 
   let kind: "aria" | "text" = "aria";
   let content = "";
+  let unrendered = 0;
   try {
     content = await root.ariaSnapshot({ timeout: 5_000 });
     content = collapseSelectOptions(content);
+    const marked = markUnrendered(content);
+    content = marked.text;
+    unrendered = marked.count;
   } catch {
     kind = "text";
     content = await root
@@ -161,6 +200,7 @@ export async function snapshotPage(
     content: slice,
     scope: requested ?? undefined,
     scopeMissed,
+    unrendered,
   };
 }
 
@@ -182,5 +222,13 @@ export function formatSnapshot(s: SnapshotResult, offset = 0): string {
       ? `note: truncated at ${offset + s.content.length}/${s.totalChars} chars — call browser_snapshot with offset=${offset + s.content.length} for more`
       : `note: complete (${s.totalChars} chars)`,
   );
+  if (s.unrendered > 0) {
+    // Without this the tree looks complete and the agent stops early.
+    header.push(
+      `incomplete: ${s.unrendered} node(s) marked [not rendered] — rows exist but their ` +
+        `content has not loaded. This list is NOT finished; call browser_scroll ` +
+        `(to='bottom', steps=5) before reading it as complete.`,
+    );
+  }
   return `${header.join("\n")}\n---\n${s.content}`;
 }

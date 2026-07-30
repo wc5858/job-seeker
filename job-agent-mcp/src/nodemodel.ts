@@ -33,6 +33,7 @@
  * see alignChildren.
  */
 import type { Page } from "playwright";
+import { evalInPage } from "./pagefn.js";
 
 /** A baseline older than this is treated as stale — the page has moved on. */
 export const BASELINE_TTL_MS = 5 * 60_000;
@@ -267,25 +268,6 @@ export interface CaptureResult {
 }
 
 /**
- * Ship the walker into the page as a self-contained expression.
- *
- * We run under tsx, and esbuild's keep-names transform rewrites every nested
- * function into `__name(fn, "fn")`. That helper is defined in the Node module
- * scope, not in the page, so handing the function straight to page.evaluate
- * dies with `ReferenceError: __name is not defined` — in production, not just
- * in tests. Wrapping the source in a closure that declares its own `__name`
- * fixes it without touching page globals. Evaluating a string is CSP-safe here:
- * Playwright evaluates through CDP, which is not subject to the page's
- * script-src policy (this matters — LinkedIn forbids eval).
- */
-function walkerExpression(scopeSel: string | null): string {
-  return `(function (scopeSel) {
-    var __name = function (f) { return f; };
-    return (${walkDocument.toString()})(scopeSel);
-  })(${JSON.stringify(scopeSel)})`;
-}
-
-/**
  * Errors deliberately propagate. An empty node list is indistinguishable from
  * "nothing changed", so swallowing a walker failure here would make browser_diff
  * confidently report "no changes" forever — the exact silent-success failure the
@@ -293,10 +275,10 @@ function walkerExpression(scopeSel: string | null): string {
  */
 export async function captureNodes(page: Page, scope: string | null): Promise<CaptureResult> {
   if (scope) {
-    const scoped = await page.evaluate<AriaNode[] | null>(walkerExpression(scope));
+    const scoped = await evalInPage(page, walkDocument, scope);
     if (scoped) return { nodes: scoped, scopeMissed: false };
   }
-  const full = await page.evaluate<AriaNode[] | null>(walkerExpression(null));
+  const full = await evalInPage(page, walkDocument, null);
   return { nodes: full ?? [], scopeMissed: scope !== null };
 }
 

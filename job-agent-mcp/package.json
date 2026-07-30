@@ -8,6 +8,7 @@
     "login": "tsx src/login.ts",
     "smoke": "tsx scripts/smoke.ts",
     "golden": "tsx scripts/golden-add-experience.ts",
+    "golden:lazy": "tsx scripts/golden-lazy-list.ts",
     "roundtrip": "tsx scripts/mcp-roundtrip.ts",
     "typecheck": "tsc --noEmit"
   },

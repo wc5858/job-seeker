@@ -17,6 +17,8 @@ desktop bridge as `mcp__remote-devices__job-agent__*`).
 | `browser_click` | Click by ARIA role+name (preferred) or raw Playwright selector |
 | `browser_fill` | Fill a text input or contenteditable (never submits) |
 | `browser_select` | Choose an option in a native `<select>` |
+| `browser_scroll` | Scroll a container in steps to load lazily rendered content |
+| `browser_scroll_into_view` | Scroll a specific element into view by role+name or selector |
 | `browser_press` | Press a keyboard key (`Enter`, `Escape`, ...) |
 | `browser_screenshot` | Viewport screenshot — fallback sense for oddly structured pages |
 | `browser_tabs` | List open tabs |
@@ -74,6 +76,51 @@ just call `browser_select`, which reports the real options when it misses.
 
 On the LinkedIn *Add experience* form this takes the worst tool result from
 ~12,000 chars to under 1,700.
+
+### Lazy lists: the failure that doesn't raise
+
+A LinkedIn search page holds 25 results but renders about 10; the rest are empty
+`<li>` placeholders. The snapshot comes back well-formed, so an agent reads it
+as "the list ends here" — a complete-looking, incomplete answer. Every other gap
+in this toolset announces itself with an exception; this one does not.
+
+Two halves to the fix. Empty container nodes are marked in the snapshot, and the
+header says the list is unfinished:
+
+```
+incomplete: 15 node(s) marked [not rendered] — rows exist but their content has not
+loaded. This list is NOT finished; call browser_scroll (to='bottom', steps=5) ...
+---
+- listitem [not rendered]
+```
+
+And `browser_scroll` loads them:
+
+```
+browser_scroll  selector='.scaffold-layout__list'  to='bottom'  steps=5
+```
+
+- **Pass `selector` when the page itself scrolls.** Auto-detection uses the
+  document when it scrolls and the largest inner scroller otherwise, so on a
+  layout that has both — LinkedIn — it scrolls the page and loads nothing.
+- **Steps matter.** Jumping straight to the bottom often loads nothing: an
+  IntersectionObserver that never observes an intersection never fires. The
+  travel is split into increments with a render pause between them, and the
+  target is recomputed each step because the content grows underneath. In the
+  golden set a one-shot jump leaves 10 of 25 rows unrendered; 5 steps leaves 0.
+- **`browser_press('End')` is not a substitute** — it acts on whatever has
+  focus, which is why it only ever worked by accident.
+
+The result reports whether anything actually loaded, counting both new elements
+and new height (placeholder rows already occupy their final height, so height
+alone would miss them):
+
+```
+loaded: nothing new — at the bottom with no growth, so this really is the end of the list
+```
+
+`browser_scroll_into_view` takes role+name or a selector, for reaching a known
+target rather than sweeping a container.
 
 ### Verifying that a step actually worked
 
@@ -205,6 +252,7 @@ tools as `mcp__remote-devices__job-agent__*` automatically.
 npm run typecheck
 npm run smoke                      # offline self-hosted site, full tool internals
 npm run golden                     # golden set: LinkedIn "Add experience" replica
+npm run golden:lazy                # golden set: lazy-loaded search results
 npm run roundtrip                  # real MCP stdio round-trip
 npx tsx scripts/attach-test.ts     # auto-spawn + attach path
 ```
@@ -228,6 +276,12 @@ that cannot detect the known-bad behaviour is not protecting anything. After
 changing a prompt or a selector, this pinpoints which step regressed instead of
 leaving you to judge the final state.
 
+`npm run golden:lazy` covers the search-results shape: a list whose rows are
+filled by an IntersectionObserver, inside an inner scroll container, on a page
+that also scrolls. It asserts the placeholder marking, that auto-detection
+scrolls the page rather than the list, and that a stepped scroll loads rows a
+one-shot jump misses.
+
 `golden` and `roundtrip` use their own CDP port and profile, so they never
 disturb the browser you are working in. In headless environments, set
 `CHROME_PATH` and `JOB_AGENT_SPAWN_ARGS="--headless=new,--no-sandbox"`.
@@ -237,7 +291,8 @@ disturb the browser you are working in. In headless environments, set
 - [ ] `browser_tab_select` — explicit tab targeting (the "last tab" heuristic is fragile)
 - [ ] Domain tools: `search_jobs` / `extract_jd` on top of the atomic tools
 - [x] Golden-set regression: LinkedIn *Add experience* form (`npm run golden`)
-- [ ] Golden set for job search / JD extraction pages
+- [x] Golden set for lazy-loaded search results (`npm run golden:lazy`)
+- [ ] Golden set for JD extraction pages
 - [ ] Screenshot-based extraction for fields not exposed in the ARIA tree
       (contenteditable text is one — the ARIA tree omits it entirely)
 - [ ] Standalone agent loop + CLI as an alternative decision layer

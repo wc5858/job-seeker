@@ -39,6 +39,7 @@ import {
   clearBaseline,
   baselineMismatch,
 } from "./nodemodel.js";
+import { scrollContainer, waitForContentSettled, formatScroll } from "./scroll.js";
 import type { Page, Locator } from "playwright";
 
 /**
@@ -420,6 +421,82 @@ server.registerTool(
     await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => {});
     const snap = await snapshotPage(page);
     return ok(`selected: '${match.hit.label}' (value='${match.hit.value}')\n${formatSnapshot(snap)}`);
+  },
+);
+
+server.registerTool(
+  "browser_scroll",
+  {
+    description:
+      "Scroll a container to load lazily rendered content. Use this whenever a snapshot shows " +
+      "nodes marked [not rendered]: those rows exist but their content has not loaded, and the " +
+      "tree LOOKS complete without them — a list that ends early is the failure this prevents. " +
+      "Do NOT use browser_press('End') for this; it acts on whatever has focus and only works by " +
+      "accident. Scrolls in `steps` increments with a pause between them, because jumping " +
+      "straight to the bottom often loads nothing (an IntersectionObserver that never observes " +
+      "an intersection never fires). Waits for content to settle, then returns a fresh snapshot. " +
+      "The report says whether the content height grew — if it did not and you are at the " +
+      "bottom, the list really has ended.",
+    inputSchema: {
+      selector: z
+        .string()
+        .optional()
+        .describe(
+          "CSS selector of the scrolling element, e.g. '.scaffold-layout__list'. Omit to auto-detect: " +
+            "the page itself when it scrolls, otherwise the largest inner scroller. Many apps " +
+            "(LinkedIn included) scroll an inner element rather than the window, so pass this when " +
+            "auto-detection scrolls the wrong thing.",
+        ),
+      to: z
+        .union([z.enum(["top", "bottom"]), z.number()])
+        .default("bottom")
+        .describe("'bottom', 'top', or an absolute scrollTop in pixels"),
+      steps: z
+        .number()
+        .int()
+        .min(1)
+        .max(20)
+        .default(5)
+        .describe("Split the travel into this many increments, pausing between each to let content render"),
+    },
+  },
+  async ({ selector, to, steps }) => {
+    const page = await activePage();
+    const outcome = await scrollContainer(page, selector ?? null, to, steps);
+    if (!outcome) {
+      return fail(
+        `No element matches selector '${selector}'. Take a browser_snapshot to check the page, ` +
+          `or omit selector to auto-detect the scrolling container.`,
+      );
+    }
+    const snap = await snapshotPage(page);
+    return ok(`${formatScroll(outcome)}\n---\n${formatSnapshot(snap)}`);
+  },
+);
+
+server.registerTool(
+  "browser_scroll_into_view",
+  {
+    description:
+      "Scroll a specific element into view, by ARIA role+name or selector — for reaching a known " +
+      "target (a 'Next' button below the fold, a row near the end of a long list) rather than " +
+      "sweeping a container. Waits for content to settle and returns a fresh snapshot.",
+    inputSchema: targetShape,
+  },
+  async (args) => {
+    const page = await activePage();
+    const target = resolveTarget(page, args);
+    try {
+      await target.scrollIntoViewIfNeeded({ timeout: 8_000 });
+    } catch (e) {
+      return fail(
+        `Could not scroll to it: ${(e as Error).message.split("\n")[0]}\n` +
+          `If the element is inside a lazily rendered list it may not exist yet — ` +
+          `browser_scroll the container first, then retry.`,
+      );
+    }
+    await waitForContentSettled(page, null);
+    return ok(formatSnapshot(await snapshotPage(page)));
   },
 );
 

@@ -102,26 +102,56 @@ Desktop, and cloud Cowork sessions (proxied through the desktop bridge as
     `__name(fn, "fn")`; that helper does not exist in the browser, so handing
     a function with inner helpers to `page.evaluate` dies with
     `ReferenceError: __name is not defined` — in production, not just in tests.
-    `nodemodel.ts` ships the walker as a string wrapped in a closure that
-    declares its own `__name`. Evaluating a string is CSP-safe because
+    **Always go through `evalInPage` in `pagefn.ts`** (extracted 2026-07-30 when
+    `scroll.ts` became the second caller); never call `page.evaluate` with a
+    function directly. Evaluating a string is CSP-safe because
     Playwright evaluates through CDP, which page `script-src` does not gate
     (LinkedIn forbids `eval`, so `new Function` inside the page is not an
     option). **Never `.catch(() => [])` around a page.evaluate that feeds the
     diff** — an empty node list is indistinguishable from "nothing changed",
     which is how this bug hid for a whole test run.
 
-## Current toolset (v0.4)
+13. **Lazy lists are the only failure mode that does not raise** (added
+    2026-07-30, same LinkedIn run). A search page holds 25 results and renders
+    ~10; the rest are empty `<li>`. The ARIA snapshot is well-formed, so the
+    agent reads it as "list ended" — a complete-looking, incomplete answer.
+    Fixed on both sides: `snapshot.ts` marks childless, unnamed container nodes
+    `[not rendered]` and adds an `incomplete:` header line, and `browser_scroll`
+    loads them. `cell` and `option` are excluded from the marking — an empty
+    table cell or placeholder `<option>` is ordinary markup, not a symptom.
+14. **Scrolling is a loading primitive, not a viewport tweak.** Two properties
+    are load-bearing: (a) the scroll container is usually NOT the window, so we
+    resolve an element and set `scrollTop` — this is why `browser_press('End')`
+    only ever worked by accident, it acts on whatever has focus; (b) travel is
+    split into steps with a render pause, because an IntersectionObserver that
+    never observes an intersection never fires — a one-shot jump loads only
+    what lands in view. The golden set pins this: one-shot leaves 10 of 25 rows
+    unrendered, 5 steps leaves 0. The target is recomputed every step since
+    content grows underneath. All stepping happens inside ONE in-page async
+    function so the element reference survives DOM mutation between steps.
+    "Did anything load?" counts new elements AND new height: placeholder rows
+    already occupy their final height, so height alone misses fill-in-place
+    lazy loading.
+15. **Auto-detection prefers the document, then the largest inner scroller.**
+    On a layout where both scroll (LinkedIn) that picks the page and loads
+    nothing, which is exactly why `selector` exists and why the golden set
+    asserts the wrong-container behaviour rather than hiding it.
+
+## Current toolset (v0.5)
 
 browser_navigate / browser_snapshot (offset pagination + `scope` + `full`) /
 browser_set_snapshot_scope (session-wide scope) / browser_diff (verify the last
 action) / browser_click (role+name first, selector as escape hatch) /
 browser_fill (never submits) / browser_select (native `<select>` only) /
-browser_press / browser_screenshot / browser_tabs / browser_back /
-browser_open_human (human handoff)
+browser_scroll (lazy-load driver) / browser_scroll_into_view / browser_press /
+browser_screenshot / browser_tabs / browser_back / browser_open_human
+(human handoff)
 
 Source layout: `browser.ts`/`chrome.ts` (lifecycle), `snapshot.ts` (ARIA
-perception, scope, option collapsing), `nodemodel.ts` (DOM node model +
-structural diff), `server.ts` (tool surface).
+perception, scope, option collapsing, `[not rendered]` marking), `nodemodel.ts`
+(DOM node model + structural diff), `scroll.ts` (container resolution, stepped
+scrolling, settle wait), `pagefn.ts` (the only sanctioned way to run our code
+in the page), `server.ts` (tool surface).
 
 ## Known issues / TODO
 
@@ -130,9 +160,11 @@ structural diff), `server.ts` (tool surface).
 - [ ] Domain tools: `search_jobs` / `extract_jd` (distilled from recorded flows)
 - [x] Golden-set regression: `scripts/golden-add-experience.ts` (`npm run golden`),
       including `assertDiff` per-step DOM assertions
-- [ ] Golden set for job search / JD extraction pages — **note: the "10 offline
-      job-page snapshots" referenced in planning do not exist yet**; the only
-      golden set in the repo is the Add-experience one
+- [x] Golden set for lazy-loaded search results:
+      `scripts/golden-lazy-list.ts` (`npm run golden:lazy`)
+- [ ] Golden set for JD extraction pages — **note: the "10 offline job-page
+      snapshots" referenced in planning still do not exist**; the golden sets in
+      the repo are the two above, both built from hermetic fixtures
 - [x] `browser_diff` mid-list insertion cascade — fixed 2026-07-29 by keyed
       sibling alignment (see ADR 10); regression-tested in the golden set
 - [ ] **The ARIA tree does not expose `contenteditable` text.** A filled
@@ -146,8 +178,9 @@ structural diff), `server.ts` (tool surface).
 
 - pnpm; `pnpm run typecheck` must pass before any commit
 - Tests: `pnpm run smoke` (offline self-hosted site), `pnpm run golden`
-  (LinkedIn Add-experience replica, over real MCP stdio), `pnpm run roundtrip`,
-  and `scripts/attach-test.ts`; all run through the attach path
+  (LinkedIn Add-experience replica, over real MCP stdio), `pnpm run golden:lazy`
+  (lazy-loaded search results), `pnpm run roundtrip`, and
+  `scripts/attach-test.ts`; all run through the attach path
 - Scripts that spawn the server as a subprocess (`golden`, `roundtrip`) pin
   their own `JOB_AGENT_CDP` + `JOB_AGENT_PROFILE`, so a run never collides with
   the browser the user is working in. Never hardcode a POSIX `/tmp` path —
