@@ -22,7 +22,17 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { activePage, getContext, closeBrowser } from "./browser.js";
+import fs from "node:fs";
+import path from "node:path";
+import {
+  activePage,
+  getContext,
+  closeBrowser,
+  listPages,
+  selectPage,
+  isSelected,
+  clearSelection,
+} from "./browser.js";
 import {
   snapshotPage,
   formatSnapshot,
@@ -425,6 +435,290 @@ server.registerTool(
 );
 
 server.registerTool(
+  "browser_upload_file",
+  {
+    description:
+      "Attach a local file to a file input — the Resume field on an application form, a " +
+      "portfolio, a cover letter. Targets the <input type=file> itself via setInputFiles; it " +
+      "never clicks the visible button, because that opens the OS file dialog, which is outside " +
+      "the page and cannot be driven. This also handles the common case where the input is " +
+      "hidden behind a styled 'Choose file' label or drag-and-drop zone (a display:none input " +
+      "does not even appear in the snapshot): point role+name or selector at the visible " +
+      "label/button/dropzone and the associated input is found from it. Returns the file names " +
+      "the page now holds, plus a snapshot so you can confirm they are shown.",
+    inputSchema: {
+      ...targetShape,
+      path: z.string().optional().describe("Absolute path to the file to attach"),
+      paths: z
+        .array(z.string())
+        .optional()
+        .describe("Several files at once, for inputs that accept multiple (resume + portfolio)"),
+    },
+  },
+  async (args) => {
+    const requested = args.paths?.length ? args.paths : args.path ? [args.path] : [];
+    if (requested.length === 0) return fail("Provide `path` or a non-empty `paths` array.");
+
+    // Validate before touching the page: a missing file must be a loud error,
+    // never a silently empty upload that looks like it worked.
+    const resolved = requested.map((p) => path.resolve(p));
+    const missing = resolved.filter((p) => !fs.existsSync(p));
+    if (missing.length) {
+      return fail(
+        `File(s) not found:\n${missing.map((p) => `  ${p}`).join("\n")}\n` +
+          `Paths are resolved from the server's working directory (${process.cwd()}); ` +
+          `pass absolute paths to be safe.`,
+      );
+    }
+    const notFiles = resolved.filter((p) => !fs.statSync(p).isFile());
+    if (notFiles.length) return fail(`Not a file: ${notFiles.join(", ")}`);
+
+    const page = await activePage();
+    const target = resolveTarget(page, args);
+    let handle;
+    try {
+      // Flat on purpose: no nested named functions, so esbuild's keep-names
+      // transform has nothing to rewrite (see pagefn.ts) and this can return a
+      // live element handle, which evalInPage's JSON round-trip cannot.
+      handle = await target.evaluateHandle((el) => {
+        if (el instanceof HTMLInputElement && el.type === "file") return el;
+        const forId = el.getAttribute("for");
+        if (forId) {
+          const byFor = document.getElementById(forId);
+          if (byFor instanceof HTMLInputElement && byFor.type === "file") return byFor;
+        }
+        // A text box, textarea or select is never a stand-in for an upload
+        // field. Without this, the search below climbs to the <form> and
+        // happily attaches the file to an unrelated input — a silent wrong
+        // result, which is worse than refusing.
+        if (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.tagName === "SELECT") {
+          return null;
+        }
+        const inside = el.querySelectorAll('input[type="file"]');
+        if (inside.length === 1) return inside[0];
+        if (inside.length > 1) return null;
+        const label = el.closest("label");
+        if (label) {
+          const lf = label.getAttribute("for");
+          if (lf) {
+            const t = document.getElementById(lf);
+            if (t instanceof HTMLInputElement && t.type === "file") return t;
+          }
+          const within = label.querySelectorAll('input[type="file"]');
+          if (within.length === 1) return within[0];
+        }
+        // Styled drop zones keep the real input as a nearby sibling, so walk up
+        // a little — but stop at the form/section boundary, because "some file
+        // input somewhere on this form" is a guess, not a match. Only an
+        // unambiguous single candidate counts.
+        let cur: Element | null = el.parentElement;
+        for (let i = 0; i < 3 && cur; i++) {
+          const tag = cur.tagName;
+          if (tag === "FORM" || tag === "BODY" || tag === "HTML" || tag === "MAIN") break;
+          const found = cur.querySelectorAll('input[type="file"]');
+          if (found.length === 1) return found[0];
+          if (found.length > 1) return null;
+          cur = cur.parentElement;
+        }
+        return null;
+      });
+    } catch (e) {
+      return fail(
+        `Could not resolve the target: ${(e as Error).message.split("\n")[0]}\n` +
+          `Tip: take a browser_snapshot and target the visible label or button near the field ` +
+          `(a hidden file input is not in the snapshot at all).`,
+      );
+    }
+
+    const input = handle.asElement();
+    if (!input) {
+      // Only on the failure path: work out WHY, so the message is actionable
+      // rather than "did not work".
+      const why = await target
+        .evaluate((el) => ({
+          tag: el.tagName.toLowerCase(),
+          nearby: el.parentElement
+            ? el.parentElement.querySelectorAll('input[type="file"]').length
+            : 0,
+          onPage: document.querySelectorAll('input[type="file"]').length,
+        }))
+        .catch(() => null);
+      const detail = !why
+        ? ""
+        : why.nearby > 1
+          ? `\nThere are ${why.nearby} file inputs next to this element, so the right one is ambiguous — ` +
+            `pass a selector for the exact input.`
+          : why.tag === "input" || why.tag === "textarea" || why.tag === "select"
+            ? `\nYou targeted a <${why.tag}>, which is a different field. The page has ${why.onPage} ` +
+              `file input(s); target the label, button or drop zone belonging to the upload field.`
+            : `\nThe page has ${why.onPage} file input(s) in total.`;
+      return fail(
+        `Found the element, but no <input type="file"> is associated with it.${detail}\n` +
+          `Note that a visible file input appears in the snapshot as a BUTTON, not a textbox, and a ` +
+          `hidden one does not appear at all — target its label or drop zone, or pass a selector ` +
+          `such as 'input[type=file]'.`,
+      );
+    }
+    try {
+      await input.setInputFiles(resolved);
+    } catch (e) {
+      return fail(`Upload failed: ${(e as Error).message.split("\n")[0]}`);
+    }
+
+    // Read back what the input actually holds — the same reason browser_diff
+    // exists: a call that returned is not proof of a result.
+    const attached = await input
+      .evaluate((el) =>
+        Array.from((el as HTMLInputElement).files ?? []).map((f) => `${f.name} (${f.size} bytes)`),
+      )
+      .catch(() => [] as string[]);
+    await page.waitForLoadState("networkidle", { timeout: 5_000 }).catch(() => {});
+    return ok(
+      `attached ${attached.length} file(s): ${attached.join(", ") || "(input reports none — check the page)"}\n` +
+        formatSnapshot(await snapshotPage(page)),
+    );
+  },
+);
+
+/** One line per tab, marking the one every tool currently acts on. */
+async function tabLines(): Promise<string> {
+  const pages = await listPages();
+  const lines = await Promise.all(
+    pages.map(async (p, i) => {
+      const title = await p.title().catch(() => "?");
+      return `${isSelected(p) ? "*" : " "} ${i}: ${title} — ${p.url()}`;
+    }),
+  );
+  const active = await activePage();
+  const idx = pages.indexOf(active);
+  return (
+    `${lines.join("\n") || "(no tabs)"}\n` +
+    (pages.some((p) => isSelected(p))
+      ? `* = active tab (explicitly selected); all tools act on it until you call browser_select_tab again.`
+      : `No tab explicitly selected — tools default to the last one (index ${idx}). ` +
+        `Call browser_select_tab to pin one.`)
+  );
+}
+
+server.registerTool(
+  "browser_select_tab",
+  {
+    description:
+      "Choose which tab every other tool acts on, and bring it to the front. Essential when the " +
+      "user has their own tabs open: without it the tools fall back to 'the last tab' and a form " +
+      "sitting in tab 0 is unreachable. Do NOT re-navigate to a form's URL to reach it — that " +
+      "reloads the page and discards everything already filled in. Identify the tab by index " +
+      "(from browser_tabs), or by a url/title pattern. Selection sticks until changed.",
+    inputSchema: {
+      index: z.number().int().min(0).optional().describe("Tab index from browser_tabs"),
+      urlPattern: z
+        .string()
+        .optional()
+        .describe("Case-insensitive regex (a plain substring works too) matched against the URL"),
+      titlePattern: z
+        .string()
+        .optional()
+        .describe("Case-insensitive regex (a plain substring works too) matched against the title"),
+    },
+  },
+  async ({ index, urlPattern, titlePattern }) => {
+    const pages = await listPages();
+    if (pages.length === 0) return fail("No open tabs.");
+
+    let candidates = pages;
+    if (index !== undefined) {
+      if (index >= pages.length) {
+        return fail(`No tab at index ${index}. Open tabs:\n${await tabLines()}`);
+      }
+      candidates = [pages[index]];
+    } else if (urlPattern || titlePattern) {
+      const re = (p: string) => {
+        try {
+          return new RegExp(p, "i");
+        } catch {
+          return new RegExp(p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+        }
+      };
+      const withMeta = await Promise.all(
+        pages.map(async (p) => ({ page: p, title: await p.title().catch(() => ""), url: p.url() })),
+      );
+      candidates = withMeta
+        .filter(
+          (m) =>
+            (!urlPattern || re(urlPattern).test(m.url)) &&
+            (!titlePattern || re(titlePattern).test(m.title)),
+        )
+        .map((m) => m.page);
+    } else {
+      return fail("Provide index, urlPattern or titlePattern.");
+    }
+
+    if (candidates.length === 0) {
+      return fail(`No tab matches. Open tabs:\n${await tabLines()}`);
+    }
+    if (candidates.length > 1) {
+      return fail(
+        `${candidates.length} tabs match — pass an index instead. Open tabs:\n${await tabLines()}`,
+      );
+    }
+    await selectPage(candidates[0]);
+    // Paths and the diff baseline belong to the old document.
+    clearBaseline();
+    const page = await activePage();
+    return ok(
+      `Active tab is now ${pages.indexOf(page)}: ${await page.title().catch(() => "?")} — ${page.url()}\n` +
+        `${await tabLines()}\n---\n${formatSnapshot(await snapshotPage(page))}`,
+    );
+  },
+);
+
+server.registerTool(
+  "browser_new_tab",
+  {
+    description:
+      "Open a new tab and make it the active one. Use this instead of navigating the current tab " +
+      "when the current tab holds work you must not lose, such as a partly filled form.",
+    inputSchema: {
+      url: z.string().optional().describe("Absolute URL to open; omit for a blank tab"),
+    },
+  },
+  async ({ url }) => {
+    const ctx = await getContext();
+    const page = await ctx.newPage();
+    await selectPage(page);
+    clearBaseline();
+    if (url) {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30_000 });
+      await page.waitForLoadState("networkidle", { timeout: 8_000 }).catch(() => {});
+    }
+    return ok(`Opened and selected a new tab.\n${await tabLines()}\n---\n${formatSnapshot(await snapshotPage(page))}`);
+  },
+);
+
+server.registerTool(
+  "browser_close_tab",
+  {
+    description:
+      "Close a tab by index. Closing the active tab drops the selection, and tools fall back to " +
+      "the last remaining tab until you select one again.",
+    inputSchema: { index: z.number().int().min(0).describe("Tab index from browser_tabs") },
+  },
+  async ({ index }) => {
+    const pages = await listPages();
+    if (index >= pages.length) {
+      return fail(`No tab at index ${index}. Open tabs:\n${await tabLines()}`);
+    }
+    const victim = pages[index];
+    const wasActive = isSelected(victim);
+    const label = `${await victim.title().catch(() => "?")} — ${victim.url()}`;
+    await victim.close();
+    if (wasActive) clearSelection();
+    clearBaseline();
+    return ok(`Closed tab ${index}: ${label}\n${await tabLines()}`);
+  },
+);
+
+server.registerTool(
   "browser_scroll",
   {
     description:
@@ -539,16 +833,12 @@ server.registerTool(
 server.registerTool(
   "browser_tabs",
   {
-    description: "List open tabs (index, title, url). The last tab is the active one for tools.",
+    description:
+      "List open tabs (index, title, url), marking with '*' the one every tool currently acts " +
+      "on. Use browser_select_tab to change it.",
     inputSchema: {},
   },
-  async () => {
-    const ctx = await getContext();
-    const lines = await Promise.all(
-      ctx.pages().map(async (p, i) => `${i}: ${await p.title().catch(() => "?")} — ${p.url()}`),
-    );
-    return ok(lines.join("\n") || "(no tabs)");
-  },
+  async () => ok(await tabLines()),
 );
 
 server.registerTool(

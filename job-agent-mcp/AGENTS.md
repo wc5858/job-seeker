@@ -137,18 +137,59 @@ Desktop, and cloud Cowork sessions (proxied through the desktop bridge as
     nothing, which is exactly why `selector` exists and why the golden set
     asserts the wrong-container behaviour rather than hiding it.
 
-## Current toolset (v0.5)
+16. **Human verification is a boundary, not a gap.** CAPTCHAs, Cloudflare
+    Turnstile and friends are never to be solved, worked around, or probed —
+    that is what they are for, and write actions need a human anyway. **The
+    agent's job ends at "the form is filled in, stopped before submit."**
+    Filling everything and handing over is the successful outcome, not a
+    partial one. This sits alongside ADR 7 (no autonomous send/submit): 7 says
+    do not press the button, this says do not defeat the check that guards it.
+17. **File uploads go to the input, never through the button** (added
+    2026-07-30, from a Workable application). Clicking the visible control
+    opens the OS file dialog, which is outside the page and undrivable;
+    `setInputFiles` on the `<input type=file>` is the only route. Two ARIA
+    facts make this field hard to even see: a visible file input serializes as
+    `button`, and a `display:none` one **does not appear in the snapshot at
+    all** — which is the Workable shape (a styled "Choose file" label plus a
+    drop zone). So `browser_upload_file` resolves the input from whatever
+    visible element you target. The search deliberately refuses to climb past
+    `<form>` and refuses ambiguity: attaching a resume to the wrong input
+    silently is worse than an error. Targeting a text field is refused
+    outright — a textbox is never a stand-in for an upload control.
+18. **The active tab is explicit state.** "The last tab" was a real dead end:
+    with the form in tab 0 and the user's own LinkedIn in tab 1, every tool
+    addressed the wrong tab, and re-navigating to the form would have wiped the
+    answers already typed in. `browser_select_tab` pins a tab and every tool
+    follows it until it changes; `browser_tabs` marks it with `*`. The
+    last-tab fallback survives only for the unselected case, so a popup opened
+    by the site is still picked up.
+19. **Snapshot fidelity for text fields** (added 2026-07-30, same run). The
+    ARIA tree flattens newlines to spaces — which once produced a *false* bug
+    report to the user about a mangled field — renders `<input>` and
+    `<textarea>` identically as `textbox` with no maxlength, and omits
+    contenteditable values. `snapshot.ts` therefore annotates textbox lines
+    from the DOM: `[input, maxlength=120, 34 used]`, newlines as `⏎`, and
+    `… [truncated, N chars total]` instead of a bare cut. Matching is **by
+    accessible name and only when unique** — a positional match is faster but
+    would mislabel a field's maxlength when the two lists diverge, and wrong
+    metadata is worse than none. This also closes the old "ARIA does not expose
+    contenteditable text" known issue.
+
+## Current toolset (v0.6)
 
 browser_navigate / browser_snapshot (offset pagination + `scope` + `full`) /
 browser_set_snapshot_scope (session-wide scope) / browser_diff (verify the last
 action) / browser_click (role+name first, selector as escape hatch) /
 browser_fill (never submits) / browser_select (native `<select>` only) /
+browser_upload_file (resolves the input from the visible control) /
 browser_scroll (lazy-load driver) / browser_scroll_into_view / browser_press /
-browser_screenshot / browser_tabs / browser_back / browser_open_human
+browser_screenshot / browser_tabs (marks the active tab) / browser_select_tab /
+browser_new_tab / browser_close_tab / browser_back / browser_open_human
 (human handoff)
 
-Source layout: `browser.ts`/`chrome.ts` (lifecycle), `snapshot.ts` (ARIA
-perception, scope, option collapsing, `[not rendered]` marking), `nodemodel.ts`
+Source layout: `browser.ts`/`chrome.ts` (lifecycle + active-tab selection),
+`snapshot.ts` (ARIA perception, scope, option collapsing, `[not rendered]`
+marking, field annotation), `nodemodel.ts`
 (DOM node model + structural diff), `scroll.ts` (container resolution, stepped
 scrolling, settle wait), `pagefn.ts` (the only sanctioned way to run our code
 in the page), `server.ts` (tool surface).
@@ -162,25 +203,29 @@ in the page), `server.ts` (tool surface).
       including `assertDiff` per-step DOM assertions
 - [x] Golden set for lazy-loaded search results:
       `scripts/golden-lazy-list.ts` (`npm run golden:lazy`)
+- [x] Golden set for the Workable application form (upload, tabs, field
+      fidelity): `scripts/golden-application-form.ts` (`npm run golden:apply`)
 - [ ] Golden set for JD extraction pages — **note: the "10 offline job-page
       snapshots" referenced in planning still do not exist**; the golden sets in
       the repo are the two above, both built from hermetic fixtures
 - [x] `browser_diff` mid-list insertion cascade — fixed 2026-07-29 by keyed
       sibling alignment (see ADR 10); regression-tested in the golden set
-- [ ] **The ARIA tree does not expose `contenteditable` text.** A filled
-      description reads back as a bare `textbox "Description"`, so the agent
-      cannot verify what it wrote. The golden set works around it via the
-      character counter the field drives; a real fix needs screenshot-based or
-      DOM-text extraction.
-- [ ] Screenshot-based extraction for fields not exposed in the ARIA tree
+- [x] **The ARIA tree does not expose `contenteditable` text** — fixed
+      2026-07-30 by the DOM-sourced field annotation (ADR 19); the value now
+      appears in the snapshot with newlines intact
+- [ ] Screenshot-based extraction for other fields not exposed in the ARIA tree
+      (some sites render salaries in ways the tree cannot capture)
+- [ ] Field annotation matches by accessible name, so two fields sharing a name
+      are both left unannotated. Fails safe, but they show no maxlength
 
 ## Conventions
 
 - pnpm; `pnpm run typecheck` must pass before any commit
 - Tests: `pnpm run smoke` (offline self-hosted site), `pnpm run golden`
   (LinkedIn Add-experience replica, over real MCP stdio), `pnpm run golden:lazy`
-  (lazy-loaded search results), `pnpm run roundtrip`, and
-  `scripts/attach-test.ts`; all run through the attach path
+  (lazy-loaded search results), `pnpm run golden:apply` (Workable application
+  form), `pnpm run roundtrip`, and `scripts/attach-test.ts`; all run through the
+  attach path
 - Scripts that spawn the server as a subprocess (`golden`, `roundtrip`) pin
   their own `JOB_AGENT_CDP` + `JOB_AGENT_PROFILE`, so a run never collides with
   the browser the user is working in. Never hardcode a POSIX `/tmp` path —

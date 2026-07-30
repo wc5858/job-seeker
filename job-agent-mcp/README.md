@@ -17,17 +17,26 @@ desktop bridge as `mcp__remote-devices__job-agent__*`).
 | `browser_click` | Click by ARIA role+name (preferred) or raw Playwright selector |
 | `browser_fill` | Fill a text input or contenteditable (never submits) |
 | `browser_select` | Choose an option in a native `<select>` |
+| `browser_upload_file` | Attach local file(s) to a file input, including hidden ones |
 | `browser_scroll` | Scroll a container in steps to load lazily rendered content |
 | `browser_scroll_into_view` | Scroll a specific element into view by role+name or selector |
 | `browser_press` | Press a keyboard key (`Enter`, `Escape`, ...) |
 | `browser_screenshot` | Viewport screenshot — fallback sense for oddly structured pages |
-| `browser_tabs` | List open tabs |
+| `browser_tabs` | List open tabs, marking the active one |
+| `browser_select_tab` | Choose which tab every tool acts on (index / url / title) |
+| `browser_new_tab` | Open a tab and make it active |
+| `browser_close_tab` | Close a tab by index |
 | `browser_back` | Go back in history |
 | `browser_open_human` | Hand the shared window to the human (logins, QR codes, captchas) |
 
 Design notes: perception is ARIA-first (what the agent reads is exactly what it
 can click); screenshots are the fallback. **No tool sends messages or submits
 applications autonomously — send-class actions always go through the human.**
+
+**Human verification is a boundary, not a gap.** Nothing here solves or works
+around CAPTCHAs or Cloudflare Turnstile; that is what they are for. The agent's
+job ends at *the form is filled in, stopped before submit* — that is the
+successful outcome, not a partial one.
 
 ### Picking the right tool for a form control
 
@@ -39,11 +48,73 @@ different tools:
 | Text input, textarea, `contenteditable` | `browser_fill` |
 | Native `<select>` | `browser_select` |
 | Typeahead / autocomplete listbox (LinkedIn company, location) | `browser_fill`, then `browser_press` `ArrowDown` + `Enter` |
+| File input, visible or hidden behind a styled button | `browser_upload_file` |
 
 `browser_select` only accepts a real `<select>`; point it at anything else and
 it says which of the other two paths to take. Give it the option's visible text
 (`Full-time`); its `value` attribute and a unique prefix (`Jan` → `January`)
 also work, and a wrong value comes back with the actual option list.
+
+### Reading form fields accurately
+
+The raw ARIA tree loses three things that decide whether a form gets filled
+correctly, so snapshots annotate `textbox` lines from the DOM:
+
+```
+- textbox "Why do you want to work here?" [input, maxlength=120, 34 used]: ...
+- textbox "Cover letter" [textarea, maxlength=5000, 58 used]: Dear team,⏎⏎I have shipped...
+- textbox "Additional notes" [contenteditable]: Para one⏎Para two
+```
+
+- **`<input>` and `<textarea>` are otherwise identical** in the tree, both just
+  `textbox`, and maxlength is invisible. A long answer written into a capped
+  single-line input is silently cut at submit time.
+- **Newlines were flattened to spaces.** That once produced a false bug report
+  about a mangled field that was actually fine. They now show as `⏎`.
+- **Long values** end with `… [truncated, 900 chars total]` rather than simply
+  stopping, which looked like the field held only that much.
+- **contenteditable values** were omitted entirely; they now appear.
+
+Annotation is matched by accessible name and only when that name is unique
+among the page's fields — a positional match would be faster but could pin the
+wrong maxlength to a field, and wrong metadata is worse than none.
+
+### Uploading files
+
+```
+browser_upload_file  selector='label.choose-resume'  path='/abs/path/resume.pdf'
+```
+
+It always drives the `<input type=file>` via `setInputFiles` and never clicks
+the visible control, because that opens the OS file dialog, which is outside
+the page and cannot be automated. Two things make the field hard to even find,
+both handled:
+
+- a **visible** file input appears in the snapshot as a `button`, not a textbox;
+- a **hidden** one (`display:none`, the Workable shape — a styled "Choose file"
+  label plus a drop zone) does not appear in the snapshot **at all**.
+
+So point it at whatever is visible — the label, the button, the drop zone — and
+the associated input is resolved from there. `paths: [...]` attaches several at
+once. Missing files are a hard error, and the result reports the file names the
+input actually holds, so an upload that did not land cannot look like one that
+did. The search refuses to climb past `<form>` and refuses ambiguous matches:
+attaching a resume to the wrong field silently is worse than an error.
+
+### Working with several tabs
+
+Tools act on one explicitly selected tab:
+
+```
+browser_select_tab  urlPattern='/apply'
+```
+
+Without this, tools fall back to "the last tab" — so a form open in tab 0 with
+the user's own browsing in tab 1 is simply unreachable, and re-navigating to the
+form's URL to reach it reloads the page and discards everything already typed.
+Selection sticks until changed; `browser_tabs` marks the active tab with `*`.
+Select by `index`, `urlPattern` or `titlePattern` (case-insensitive regex; a
+plain substring works). An ambiguous pattern is refused rather than guessed.
 
 ### Keeping snapshots small
 
@@ -253,6 +324,7 @@ npm run typecheck
 npm run smoke                      # offline self-hosted site, full tool internals
 npm run golden                     # golden set: LinkedIn "Add experience" replica
 npm run golden:lazy                # golden set: lazy-loaded search results
+npm run golden:apply               # golden set: Workable application form
 npm run roundtrip                  # real MCP stdio round-trip
 npx tsx scripts/attach-test.ts     # auto-spawn + attach path
 ```
@@ -282,17 +354,25 @@ that also scrolls. It asserts the placeholder marking, that auto-detection
 scrolls the page rather than the list, and that a stepped scroll loads rows a
 one-shot jump misses.
 
+`npm run golden:apply` covers the application-form shape: a resume input hidden
+behind a styled label and drop zone, a second tab competing for the tools, and
+fields whose type, maxlength and newlines the raw ARIA tree loses. It asserts
+that switching tabs does not lose typed answers, that uploads reach the page,
+and that a misdirected upload errors instead of silently attaching to the wrong
+field. It carries a Turnstile widget that the suite never touches.
+
 `golden` and `roundtrip` use their own CDP port and profile, so they never
 disturb the browser you are working in. In headless environments, set
 `CHROME_PATH` and `JOB_AGENT_SPAWN_ARGS="--headless=new,--no-sandbox"`.
 
 ## Roadmap
 
-- [ ] `browser_tab_select` — explicit tab targeting (the "last tab" heuristic is fragile)
+- [x] Explicit tab targeting — `browser_select_tab` (the "last tab" heuristic was fragile)
 - [ ] Domain tools: `search_jobs` / `extract_jd` on top of the atomic tools
 - [x] Golden-set regression: LinkedIn *Add experience* form (`npm run golden`)
 - [x] Golden set for lazy-loaded search results (`npm run golden:lazy`)
+- [x] Golden set for the Workable application form (`npm run golden:apply`)
 - [ ] Golden set for JD extraction pages
 - [ ] Screenshot-based extraction for fields not exposed in the ARIA tree
-      (contenteditable text is one — the ARIA tree omits it entirely)
+      (contenteditable text used to be one; that is now handled by field annotation)
 - [ ] Standalone agent loop + CLI as an alternative decision layer

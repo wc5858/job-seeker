@@ -65,14 +65,51 @@ export async function getContext(): Promise<BrowserContext> {
   return contextPromise;
 }
 
-/** The page the agent is currently working on = the most recently active tab. */
-export async function activePage(): Promise<Page> {
+/**
+ * Explicitly selected tab, or null to fall back to the "last tab" heuristic.
+ *
+ * The heuristic alone was a real dead end: with the application form in tab 0
+ * and the user's own LinkedIn in tab 1, every tool addressed the wrong tab and
+ * the form was simply unreachable — re-navigating to it would have wiped the
+ * answers already typed in. Selection is sticky on purpose: once set, every
+ * tool works on that tab until it is changed or the tab closes.
+ *
+ * The fallback is kept for the unselected case so that a popup opened by the
+ * site is still picked up automatically.
+ */
+let selectedPage: Page | null = null;
+
+export async function listPages(): Promise<Page[]> {
   const ctx = await getContext();
-  const pages = ctx.pages();
+  return ctx.pages().filter((p) => !p.isClosed());
+}
+
+/** The page every tool acts on. */
+export async function activePage(): Promise<Page> {
+  const pages = await listPages();
+  if (selectedPage && !selectedPage.isClosed() && pages.includes(selectedPage)) {
+    return selectedPage;
+  }
+  selectedPage = null; // it went away; drop the stale selection
   if (pages.length === 0) {
+    const ctx = await getContext();
     return await ctx.newPage();
   }
   return pages[pages.length - 1];
+}
+
+/** Make `page` the active tab and bring it to the front of the shared window. */
+export async function selectPage(page: Page): Promise<void> {
+  selectedPage = page;
+  await page.bringToFront().catch(() => {});
+}
+
+export function isSelected(page: Page): boolean {
+  return selectedPage === page;
+}
+
+export function clearSelection(): void {
+  selectedPage = null;
 }
 
 /**
@@ -80,6 +117,7 @@ export async function activePage(): Promise<Page> {
  * connectOverCDP browser, close() only terminates the connection.
  */
 export async function closeBrowser(): Promise<void> {
+  selectedPage = null;
   if (!contextPromise) return;
   const ctx = await contextPromise.catch(() => null);
   contextPromise = null;

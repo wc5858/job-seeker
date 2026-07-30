@@ -9,6 +9,7 @@
     "smoke": "tsx scripts/smoke.ts",
     "golden": "tsx scripts/golden-add-experience.ts",
     "golden:lazy": "tsx scripts/golden-lazy-list.ts",
+    "golden:apply": "tsx scripts/golden-application-form.ts",
     "roundtrip": "tsx scripts/mcp-roundtrip.ts",
     "typecheck": "tsc --noEmit"
   },

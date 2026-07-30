@@ -22,6 +22,133 @@
  * lists are collapsed to a one-line summary — see collapseSelectOptions.
  */
 import type { Page, Locator } from "playwright";
+import { evalInPage } from "./pagefn.js";
+
+/** How much of a field's value to show before cutting it. */
+const VALUE_CHARS = 240;
+
+interface FieldInfo {
+  name: string;
+  /** "input", "input:email", "textarea" or "contenteditable". */
+  kind: string;
+  maxLength: number | null;
+  value: string;
+}
+
+/**
+ * Read editable fields straight from the DOM, because the ARIA snapshot loses
+ * exactly what matters when filling a form:
+ *
+ *   - it flattens newlines to spaces, so a multi-line answer reads as mangled
+ *     (this produced a false bug report to the user — the field was fine);
+ *   - it renders <input> and <textarea> identically as `textbox`, so there is
+ *     no way to see that a field is single-line, and no way to see maxlength.
+ *     A long answer written into a maxlength-capped input is silently cut;
+ *   - it omits contenteditable values entirely.
+ */
+function collectFields(scopeSel: string | null): FieldInfo[] | null {
+  const root: Element | null = scopeSel ? document.querySelector(scopeSel) : document.body;
+  if (!root) return null;
+
+  const SKIP_TYPES = new Set([
+    "button", "submit", "reset", "hidden", "file", "checkbox", "radio", "image", "range", "color",
+  ]);
+  const out: FieldInfo[] = [];
+  const nodes = root.querySelectorAll(
+    'input, textarea, [contenteditable=""], [contenteditable="true"]',
+  );
+
+  for (let i = 0; i < nodes.length; i++) {
+    const el = nodes[i] as HTMLElement;
+    let kind: string;
+    let value: string;
+    let maxLength: number | null = null;
+    if (el.tagName === "INPUT") {
+      const inp = el as HTMLInputElement;
+      const type = (inp.getAttribute("type") || "text").toLowerCase();
+      if (SKIP_TYPES.has(type)) continue;
+      kind = type === "text" ? "input" : `input:${type}`;
+      value = inp.value;
+      maxLength = inp.maxLength >= 0 ? inp.maxLength : null;
+    } else if (el.tagName === "TEXTAREA") {
+      const ta = el as HTMLTextAreaElement;
+      kind = "textarea";
+      value = ta.value;
+      maxLength = ta.maxLength >= 0 ? ta.maxLength : null;
+    } else {
+      // Nested editable regions belong to their host, not to themselves.
+      if (el.parentElement && el.parentElement.isContentEditable) continue;
+      kind = "contenteditable";
+      value = el.innerText || "";
+    }
+
+    // Accessible name, resolved the same way the ARIA tree resolves it, so the
+    // annotation can be matched back onto the right line.
+    let name = el.getAttribute("aria-label") || "";
+    if (!name) {
+      const by = el.getAttribute("aria-labelledby");
+      if (by) {
+        const parts: string[] = [];
+        const ids = by.split(/\s+/);
+        for (let k = 0; k < ids.length; k++) {
+          const t = document.getElementById(ids[k]);
+          if (t && t.textContent) parts.push(t.textContent);
+        }
+        name = parts.join(" ");
+      }
+    }
+    if (!name && el.id) {
+      const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      if (lbl && lbl.textContent) name = lbl.textContent;
+    }
+    if (!name) {
+      const wrap = el.closest("label");
+      if (wrap && wrap.textContent) name = wrap.textContent;
+    }
+    if (!name) name = el.getAttribute("placeholder") || "";
+    out.push({ name: name.replace(/\s+/g, " ").trim(), kind, maxLength, value });
+  }
+  return out;
+}
+
+/** Newlines survive as a visible marker: the tree is line-based, so a real \n would break it. */
+function renderValue(value: string): string {
+  const flat = value.replace(/\r\n|\r|\n/g, "⏎");
+  if (flat.length <= VALUE_CHARS) return flat;
+  return `${flat.slice(0, VALUE_CHARS)}… [truncated, ${value.length} chars total]`;
+}
+
+/**
+ * Annotate `textbox` lines with what kind of control they actually are.
+ *
+ * Matched by accessible name, and ONLY when that name is unique among the
+ * fields found — a positional match would be faster but would silently
+ * mislabel a field's maxlength when the two lists diverge, and wrong metadata
+ * here is worse than none.
+ */
+function annotateFields(content: string, fields: FieldInfo[]): string {
+  const byName = new Map<string, FieldInfo | "ambiguous">();
+  for (const f of fields) {
+    if (!f.name) continue;
+    byName.set(f.name, byName.has(f.name) ? "ambiguous" : f);
+  }
+  return content
+    .split("\n")
+    .map((line) => {
+      const m = /^(\s*- textbox "([^"]*)")(?::\s?(.*))?$/.exec(line);
+      if (!m) return line;
+      const found = byName.get(m[2]);
+      if (!found || found === "ambiguous") return line;
+      const meta = [found.kind];
+      if (found.maxLength !== null) {
+        meta.push(`maxlength=${found.maxLength}`);
+        meta.push(`${found.value.length} used`);
+      }
+      const rendered = found.value ? `: ${renderValue(found.value)}` : "";
+      return `${m[1]} [${meta.join(", ")}]${rendered}`;
+    })
+    .join("\n");
+}
 
 const MAX_CHARS = 12_000;
 
@@ -182,6 +309,12 @@ export async function snapshotPage(
     const marked = markUnrendered(content);
     content = marked.text;
     unrendered = marked.count;
+    const fields = await evalInPage(
+      page,
+      collectFields,
+      scopeMissed ? null : (requested ?? null),
+    ).catch(() => null);
+    if (fields && fields.length) content = annotateFields(content, fields);
   } catch {
     kind = "text";
     content = await root
